@@ -1,0 +1,277 @@
+#!/usr/bin/env node
+const _ = require('lodash');
+const aws = require('aws-sdk')
+
+const argv = require('yargs')
+  .usage(`
+This script "resizes" an EBS volume by performing the following actions:
+  1. detaching the volume from the a stopped instance
+  2. creating a snapshot from that volume
+  3. creating a bigger volume from that snapshot (in the same availability zone)
+  4. attaching the new volume to the instance (in the same device location)
+  
+It must be used pointing to an instance that is:
+  - in a 'stopped' state
+  - backed by a single EBS volume of standard (AKA magnetic) type
+  
+It does not:
+  - start/stop or modify any instance
+  - delete anything (e.g. the old volume)
+  - try to kill you
+
+It also expects AWS credentials to be loaded in the environment.
+
+Usage: $0 --instance-id INSTANCE_ID
+          --availability-zone AVAILABILITY_ZONE
+          --to-size NEW_SIZE_GB
+          [--region REGION]
+  `)
+  .string('instance-id')
+  .string('availability-zone')
+  .string('region')
+  .number('to-size')
+    .describe('region', 'defaults to AWS_REGION or us-west-2')
+    .default('region', process.env['AWS_REGION'] || 'us-west-2')
+  .demandOption(['instance-id', 'availability-zone', 'to-size'])
+  .help()
+  .argv;
+
+const targetInstanceId = argv['instance-id'];
+const availabilityZone = argv['availability-zone'];
+const desiredSizeGB = argv['to-size'];
+const region = argv['region'];
+
+const EC2 = new aws.EC2({ region });
+
+Promise.delay = (delayMs, value) => {
+  return new Promise((resolve) => {
+    setTimeout(() => resolve(value), delayMs);
+  });
+};
+
+function log(message, ctx) {
+  console.log((new Date().toISOString()), message, ctx ? JSON.stringify(ctx) : '');
+}
+
+const POLL_DELAY = 5 * 1000; // 5 seconds between calls
+
+function pollUntil(operation, message, timeoutMs, start) {
+  const startTime = start || (new Date()).valueOf();
+  return operation().then(({ success, result }) => {
+    const now = (new Date()).valueOf();
+    const elapsed = now - (startTime || now);
+    if (!success) {
+      if (elapsed > timeoutMs) {
+        throw new Error(`timed out after ${elapsed / 1000} seconds waiting until: ${message}`);
+      } else {
+        log(`waiting ${POLL_DELAY / 1000} more seconds for when: ${message}`)
+        return Promise.delay(POLL_DELAY).then(() => {
+          return pollUntil(operation, message, timeoutMs, startTime || now)
+        });
+      }
+    }
+    
+    log(`success: ${message} within ${elapsed / 1000} seconds`, { result });
+    
+    return result;
+  });
+}
+
+function getStoppedInstance(instanceId, availabilityZone) {
+  const params = {
+    InstanceIds: [ instanceId ],
+    Filters: [
+      {
+        Name: 'instance-state-name',
+        Values: [ 'stopped' ]
+      },
+      {
+        Name: 'availability-zone',
+        Values: [ availabilityZone ]
+      }
+    ]
+  };
+  
+  return EC2.describeInstances(params).promise()
+    .then((data) => {
+      if (_.isEmpty(data.Reservations)) {
+        log(`did not find stopped instance ${instanceId}`, params);
+        throw new Error(`could not find a stopped instance of ID ${instanceId}`);
+      }
+
+      const { Instances } = _.head(data.Reservations);
+      const { InstanceId, Placement } = _.head(Instances);
+      
+      return { instanceId: InstanceId, availabilityZone: Placement.AvailabilityZone};
+    });
+}
+
+function getSingleVolume(data) {
+  const volumes = _.get(data, 'Volumes', []);
+  if (volumes.length > 1) {
+    throw new Error(`found multiple attached volumes`);
+  } else if (_.isEmpty(volumes)) {
+    throw new Error(`could not find any attached volumes`);
+  }
+  
+  const volume = _.head(data.Volumes);
+  const { VolumeId, VolumeType, Size, AvailabilityZone, Attachments } = volume;
+  if (VolumeType !== 'standard') {
+    throw new Error(`volume ${VolumeId} is type ${VolumeType}, not "standard" - check if you can modify ${VolumeId} directly`);
+  }
+  
+  if (_.isEmpty(Attachments)) {
+    throw new Error(`could not find any Attachments for volume ${VolumeId}`);
+  }
+  
+  const device = _.first(Attachments).Device;
+  
+  return { volume, device };
+}
+
+const getSingleVolumeAttachedTo = (instance) => {
+  const { instanceId, availabilityZone } = instance;
+  const params = {
+    Filters: [
+      {
+        Name: 'attachment.instance-id',
+        Values: [ instanceId ]
+      },
+      {
+        Name: 'availability-zone',
+        Values: [ availabilityZone ]
+      }
+    ]
+  };
+  
+  return EC2.describeVolumes(params).promise()
+    .then(getSingleVolume);
+};
+
+const checkVolumeSizeSmallerThan = (sizeGB) => (ctx) => {
+  const { volume } = ctx;
+  const { Size, VolumeId } = volume;
+  if (Size > sizeGB) {
+    throw new Error(`cannot create new volume with ${sizeGB} GB from ${VolumeId}: current volume size is ${Size} GB`);
+  }
+  return ctx;
+}
+
+const volumeIsInState = (volumeId, desiredState) => () => {
+  return EC2.describeVolumes({VolumeIds: [ volumeId ]}).promise()
+    .then(({ Volumes }) => {
+      const volume = _.head(Volumes);
+      log(`${volumeId}: state=${volume.State}`, volume);
+      return { success: volume.State === desiredState, result: volume };
+    });
+};
+
+const detachVolumeFrom = (instanceId) => (ctx) => {
+  const { volume } = ctx;
+  const { VolumeId } = volume;
+  const params = {
+    VolumeId,
+    InstanceId: instanceId
+  };
+
+  log(`detaching volume ${VolumeId} from ${instanceId}`);
+  return EC2.detachVolume(params).promise()
+    .then(() => {
+      const timeoutMs = 1 * 60 * 1000; // 1 minute
+      return pollUntil(volumeIsInState(VolumeId, 'available'), `${VolumeId} is in "available" state after detaching`, timeoutMs)
+        .then(() => ctx);
+    });
+};
+
+const snapshotIsComplete = (snapshotId) => () => {
+  return EC2.describeSnapshots({ SnapshotIds: [ snapshotId ] }).promise()
+    .then(({Snapshots}) => {
+      const snapshot = _.first(Snapshots);
+      log(`${snapshotId}: progress=${snapshot.Progress} state=${snapshot.State}`, snapshot);
+      return { success: snapshot.State === 'completed', result: snapshot };
+    });
+};
+
+const resizeVolume = (sizeGB) => (ctx) => {
+  const { volume, device } = ctx;
+  const { VolumeId, AvailabilityZone } = volume;
+  const params = {
+    VolumeId,
+    Description: `snapshot from ${VolumeId}`
+  };
+  log(`creating snapshot from volume ${VolumeId}`);
+  return EC2.createSnapshot(params).promise()
+    .then(snapshot => {
+      const { SnapshotId } = snapshot;
+      const timeoutMs = 15 * 60 * 1000; // 15 minutes
+      return pollUntil(snapshotIsComplete(SnapshotId), `${SnapshotId} is in state "completed" after creating`, timeoutMs);
+    })
+    .then(createVolumeFromSnapshot(sizeGB, AvailabilityZone))
+    .then(volume => ({ volume, device }));
+}
+
+const createVolumeFromSnapshot = (sizeGB, AvailabilityZone) => (snapshot) => {
+  const { SnapshotId } = snapshot;
+  const params = {
+    SnapshotId,
+    AvailabilityZone,
+    VolumeType: 'gp2',
+    Size: sizeGB,
+  };
+  
+  log(`creating volume from snapshot ${SnapshotId} in ${AvailabilityZone} with size=${sizeGB}GB`, snapshot);
+  return EC2.createVolume(params).promise()
+    .then((volume) => {
+      const { VolumeId, CreateTime } = volume;
+      log(`${VolumeId} created at ${CreateTime} from ${SnapshotId}`, volume);
+      
+      const timeoutMs = 1 * 60 * 1000; // 1 minute
+      return pollUntil(volumeIsInState(VolumeId, 'available'), `${VolumeId} is in "available" state after creating from snapshot ${SnapshotId}`, timeoutMs);
+    })
+};
+
+const attachToInstance = (instanceId) => (ctx) => {
+  const { volume, device } = ctx;
+  const { VolumeId } = volume;
+  
+  const params = {
+    VolumeId,
+    Device: device,
+    InstanceId: instanceId,
+  };
+
+  log(`attaching ${VolumeId} to instance ${instanceId} at ${device}`, volume);
+  return EC2.attachVolume(params).promise()
+    .then(() => {
+      const timeoutMs = 2 * 60 * 1000; // 2 minutes
+      return pollUntil(volumeIsInState(VolumeId, 'in-use'), `${VolumeId} is in state "in-use" state after attaching to ${instanceId}`, timeoutMs);
+    });
+};
+
+const instanceIsRunning = (instanceId) => () => {
+  const params = {
+    InstanceIds: [ instanceId ]
+  };
+  return EC2.describeInstances(params).promise()
+    .then(data => {
+      const { Instances } = _.head(data.Reservations);
+      const instance = _.head(Instances);
+      
+      return { success: (instance.State.Name === 'running'), result: instance };
+    });
+}
+
+getStoppedInstance(targetInstanceId, availabilityZone)
+  .then(getSingleVolumeAttachedTo)
+  .then(checkVolumeSizeSmallerThan(desiredSizeGB))
+  .then(detachVolumeFrom(targetInstanceId))
+  .then(resizeVolume(desiredSizeGB))
+  .then(attachToInstance(targetInstanceId))
+  .then((volume) => {
+    const { VolumeId } = volume;
+    log(`success: new ${VolumeId} was attached to instance ${targetInstanceId}`, instance);
+    process.exit(0);
+  }).catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
