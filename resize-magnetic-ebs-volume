@@ -220,7 +220,7 @@ const resizeVolume = sizeGB => (ctx) => {
   const { VolumeId, AvailabilityZone } = volume;
   const params = {
     VolumeId,
-    Description: `snapshot from ${VolumeId}`,
+    Description: `Resize ${VolumeId} to ${sizeGB}GB`,
   };
   log(`creating snapshot from volume ${VolumeId}`);
   return EC2.createSnapshot(params).promise()
