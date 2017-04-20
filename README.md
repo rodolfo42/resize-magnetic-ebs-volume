@@ -17,6 +17,12 @@ It does not:
 
 It also expects AWS credentials to be loaded in the environment.
 
+## Why only magnetic?
+
+Technically, it does work for volumes of any type, but so does modifying the volumes themselves for types other than `standard`, so that could be the preferred approach. This was just written to solve a specific problem.
+
+If you really want to use it for volumes of any type, you can comment the line where it checks the volume type [here](https://gist.github.com/rodolfo42/86e158547683c60df0dfdd3f689bc1b0#file-resize-magnetic-ebs-volume-L120).
+
 ## Installation
 
 ```shell
