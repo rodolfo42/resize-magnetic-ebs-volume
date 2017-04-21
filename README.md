@@ -23,9 +23,11 @@ Technically, it does work for volumes of any type, but so does modifying the vol
 
 If you really want to use it for volumes of any type, you can comment the line where it checks the volume type [here](https://gist.github.com/rodolfo42/86e158547683c60df0dfdd3f689bc1b0#file-resize-magnetic-ebs-volume-L120).
 
-## Installation
+## Usage
+
+After cloning/downloading it:
 
 ```shell
 yarn # or npm install
-./resize-magnetic-ebs-volume --instance-id INSTANCE_ID --availability-zone AVAILABILITY_ZONE --to-size NEW_SIZE_GB [--region REGION]
+./resize-magnetic-ebs-volume --instance-id INSTANCE_ID --to-size NEW_SIZE_GB [--region REGION]
 ```
