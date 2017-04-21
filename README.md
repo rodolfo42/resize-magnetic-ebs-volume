@@ -1,6 +1,6 @@
 # resize-magnetic-ebs-volume
 
-This script "resizes" an EBS volume by performing the following actions:
+This script "resizes" an AWS EBS volume by performing the following actions:
   1. detaching the volume from the a stopped instance
   2. creating a snapshot from that volume
   3. creating a bigger volume from that snapshot (in the same availability zone)
